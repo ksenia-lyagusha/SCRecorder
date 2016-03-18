@@ -151,6 +151,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     }
     
     AVCaptureVideoOrientation videoOrientation = [self actualVideoOrientationShouldUseDeviceOrientation:shouldUseDeviceOrientation];
+    
     AVCaptureConnection *videoConnection = [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
     
     if ( [videoConnection isVideoOrientationSupported]) {
@@ -1279,18 +1280,18 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     UIDeviceOrientation orientation = [[UIDevice currentDevice] orientation];
     
     if (data) {
-        if (fabs( data.acceleration.y ) < fabs( data.acceleration.x )) {
+        if (fabs(data.acceleration.y ) < fabs(data.acceleration.x )) {
             //Landscape
             if (data.acceleration.x > 0) {
                 orientation = UIDeviceOrientationLandscapeRight;
-            }else{
+            } else {
                 orientation = UIDeviceOrientationLandscapeLeft;
             }
             
             //Portrait
-        }else if (data.acceleration.y > 0){
+        } else if (data.acceleration.y > 0){
             orientation = UIDeviceOrientationPortraitUpsideDown;
-        }else{
+        } else {
             orientation = UIDeviceOrientationPortrait;
         }
     }

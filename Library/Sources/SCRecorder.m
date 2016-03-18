@@ -8,6 +8,7 @@
 
 #import "SCRecorder.h"
 #import "SCRecordSession_Internal.h"
+#import <CoreMotion/CoreMotion.h>
 #define dispatch_handler(x) if (x != nil) dispatch_async(dispatch_get_main_queue(), x)
 #define kSCRecorderRecordSessionQueueKey "SCRecorderRecordSessionQueue"
 #define kMinTimeBetweenAppend 0.004
@@ -16,6 +17,7 @@
     AVCaptureVideoPreviewLayer *_previewLayer;
     AVCaptureSession *_captureSession;
     UIView *_previewView;
+    CMMotionManager *_motionManager;
     AVCaptureVideoDataOutput *_videoOutput;
     AVCaptureMovieFileOutput *_movieOutput;
     AVCaptureAudioDataOutput *_audioOutput;
@@ -66,7 +68,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         
         _videoOrientation = AVCaptureVideoOrientationPortrait;
         _videoStabilizationMode = AVCaptureVideoStabilizationModeStandard;
-
+        
         [[NSNotificationCenter defaultCenter] addObserver:self  selector:@selector(_subjectAreaDidChange) name:AVCaptureDeviceSubjectAreaDidChangeNotification  object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionInterrupted:) name:AVAudioSessionInterruptionNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(applicationDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -76,11 +78,17 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(mediaServicesWereLost:) name:AVAudioSessionMediaServicesWereLostNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self  selector:@selector(deviceOrientationChanged:) name:UIDeviceOrientationDidChangeNotification  object:nil];
         
+        //Orientation Detection
+        _motionManager = [CMMotionManager new];
+        [_motionManager setAccelerometerUpdateInterval:0.2];
+        [_motionManager startAccelerometerUpdates];
+        
         _lastVideoBuffer = [SCSampleBufferHolder new];
         _lastAudioBuffer = [SCSampleBufferHolder new];
         _maxRecordDuration = kCMTimeInvalid;
         _resetZoomOnChangeDevice = YES;
         _mirrorOnFrontCamera = NO;
+        _autoSetVideoOrientation = YES;
         
         self.device = AVCaptureDevicePositionBack;
         _videoConfiguration = [SCVideoConfiguration new];
@@ -102,6 +110,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     [_audioConfiguration removeObserver:self forKeyPath:@"enabled"];
     [_photoConfiguration removeObserver:self forKeyPath:@"options"];
     
+    [_motionManager stopAccelerometerUpdates];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self unprepare];
 }
@@ -127,7 +136,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 - (void)deviceOrientationChanged:(id)sender {
     if (_autoSetVideoOrientation) {
         dispatch_sync(_sessionQueue, ^{
-            [self updateVideoOrientation];
+            [self updateVideoOrientationShouldUseDeviceOrientation:YES];
         });
     }
 }
@@ -136,19 +145,17 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     [self startRunning];
 }
 
-- (void)updateVideoOrientation {
+- (void)updateVideoOrientationShouldUseDeviceOrientation:(BOOL)shouldUseDeviceOrientation{
     if (!_session.currentSegmentHasAudio && !_session.currentSegmentHasVideo) {
         [_session deinitialize];
     }
     
-    AVCaptureVideoOrientation videoOrientation = [self actualVideoOrientation];
+    AVCaptureVideoOrientation videoOrientation = [self actualVideoOrientationShouldUseDeviceOrientation:shouldUseDeviceOrientation];
+    
     AVCaptureConnection *videoConnection = [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
     
-    if ([videoConnection isVideoOrientationSupported]) {
+    if ( [videoConnection isVideoOrientationSupported]) {
         videoConnection.videoOrientation = videoOrientation;
-    }
-    if ([_previewLayer.connection isVideoOrientationSupported]) {
-        _previewLayer.connection.videoOrientation = videoOrientation;
     }
     
     AVCaptureConnection *photoConnection = [_photoOutput connectionWithMediaType:AVMediaTypeVideo];
@@ -340,7 +347,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     id<SCRecorderDelegate> delegate = self.delegate;
     
     if (![delegate respondsToSelector:@selector(recorderShouldAutomaticallyRefocus:)] || [delegate recorderShouldAutomaticallyRefocus:self]) {
-        [self focusCenter];        
+        [self focusCenter];
     }
 }
 
@@ -452,6 +459,9 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 - (void)record {
     void (^block)() = ^{
         _isRecording = YES;
+        //We dont want to update the preview layer here
+        [self updateVideoOrientationShouldUseDeviceOrientation:NO];
+        
         if (_movieOutput != nil && _session != nil) {
             _movieOutput.maxRecordedDuration = self.maxRecordDuration;
             [self beginRecordSegmentIfNeeded:_session];
@@ -702,11 +712,11 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         if (!recordSession.videoInitialized) {
             NSError *error = nil;
             NSDictionary *settings = [self.videoConfiguration createAssetWriterOptionsUsingSampleBuffer:sampleBuffer];
-
+            
             CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
             [recordSession initializeVideo:settings formatDescription:formatDescription error:&error];
-//            NSLog(@"INITIALIZED VIDEO");
-
+            //            NSLog(@"INITIALIZED VIDEO");
+            
             id<SCRecorderDelegate> delegate = self.delegate;
             if ([delegate respondsToSelector:@selector(recorder:didInitializeVideoInSession:error:)]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -714,23 +724,23 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 });
             }
         }
-
+        
         if (!self.audioEnabledAndReady || recordSession.audioInitialized || recordSession.audioInitializationFailed) {
             [self beginRecordSegmentIfNeeded:recordSession];
-
+            
             if (_isRecording && recordSession.recordSegmentReady) {
                 id<SCRecorderDelegate> delegate = self.delegate;
                 CMTime duration = [self frameDurationFromConnection:connection];
-
+                
                 double timeToWait = kMinTimeBetweenAppend - (CACurrentMediaTime() - _lastAppendedVideoTime);
-
+                
                 if (timeToWait > 0) {
                     // Letting some time to for the AVAssetWriter to be ready
                     //                                    NSLog(@"Too fast! Waiting %fs", timeToWait);
                     [NSThread sleepForTimeInterval:timeToWait];
                 }
                 BOOL isFirstVideoBuffer = !recordSession.currentSegmentHasVideo;
-//                NSLog(@"APPENDING");
+                //                NSLog(@"APPENDING");
                 [self appendVideoSampleBuffer:sampleBuffer toRecordSession:recordSession duration:duration connection:connection completion:^(BOOL success) {
                     _lastAppendedVideoTime = CACurrentMediaTime();
                     if (success) {
@@ -739,7 +749,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                                 [delegate recorder:self didAppendVideoSampleBufferInSession:recordSession];
                             });
                         }
-
+                        
                         [self checkRecordSessionDuration:recordSession];
                     } else {
                         if ([delegate respondsToSelector:@selector(recorder:didSkipVideoSampleBufferInSession:)]) {
@@ -749,7 +759,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                         }
                     }
                 }];
-
+                
                 if (isFirstVideoBuffer && !recordSession.currentSegmentHasAudio) {
                     CMSampleBufferRef audioBuffer = _lastAudioBuffer.sampleBuffer;
                     if (audioBuffer != nil) {
@@ -764,7 +774,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 }
             }
         } else {
-//            NSLog(@"SKIPPING");
+            //            NSLog(@"SKIPPING");
         }
     }
 }
@@ -776,8 +786,8 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
             NSDictionary *settings = [self.audioConfiguration createAssetWriterOptionsUsingSampleBuffer:sampleBuffer];
             CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
             [recordSession initializeAudio:settings formatDescription:formatDescription error:&error];
-//            NSLog(@"INITIALIZED AUDIO");
-
+            //            NSLog(@"INITIALIZED AUDIO");
+            
             id<SCRecorderDelegate> delegate = self.delegate;
             if ([delegate respondsToSelector:@selector(recorder:didInitializeAudioInSession:error:)]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -785,14 +795,14 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                 });
             }
         }
-
+        
         if (!self.videoEnabledAndReady || recordSession.videoInitialized || recordSession.videoInitializationFailed) {
             [self beginRecordSegmentIfNeeded:recordSession];
-
+            
             if (_isRecording && recordSession.recordSegmentReady && (!self.videoEnabledAndReady || recordSession.currentSegmentHasVideo)) {
                 id<SCRecorderDelegate> delegate = self.delegate;
-//                NSLog(@"APPENDING");
-
+                //                NSLog(@"APPENDING");
+                
                 [recordSession appendAudioSampleBuffer:sampleBuffer completion:^(BOOL success) {
                     if (success) {
                         if ([delegate respondsToSelector:@selector(recorder:didAppendAudioSampleBufferInSession:)]) {
@@ -800,7 +810,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                                 [delegate recorder:self didAppendAudioSampleBufferInSession:recordSession];
                             });
                         }
-
+                        
                         [self checkRecordSessionDuration:recordSession];
                     } else {
                         if ([delegate respondsToSelector:@selector(recorder:didSkipAudioSampleBufferInSession:)]) {
@@ -811,7 +821,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
                     }
                 }];
             } else {
-//                NSLog(@"SKIPPING");
+                //                NSLog(@"SKIPPING");
             }
         }
     }
@@ -820,12 +830,12 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 - (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     if (captureOutput == _videoOutput) {
         _lastVideoBuffer.sampleBuffer = sampleBuffer;
-//        NSLog(@"VIDEO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
-
+        //        NSLog(@"VIDEO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
+        
         if (_videoConfiguration.shouldIgnore) {
             return;
         }
-
+        
         SCImageView *imageView = _SCImageView;
         if (imageView != nil) {
             CFRetain(sampleBuffer);
@@ -836,13 +846,13 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         }
     } else if (captureOutput == _audioOutput) {
         _lastAudioBuffer.sampleBuffer = sampleBuffer;
-//        NSLog(@"AUDIO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
-
+        //        NSLog(@"AUDIO BUFFER: %fs (%fs)", CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer)));
+        
         if (_audioConfiguration.shouldIgnore) {
             return;
         }
     }
-
+    
     if (!_initializeSessionLazily || _isRecording) {
         SCRecordSession *recordSession = _session;
         if (recordSession != nil) {
@@ -868,7 +878,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 
 - (void)_focusDidComplete {
     id<SCRecorderDelegate> delegate = self.delegate;
-
+    
     [self setAdjustingFocus:NO];
     
     if ([delegate respondsToSelector:@selector(recorderDidEndFocus:)]) {
@@ -899,11 +909,11 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         BOOL isAdjustingExposure = [[change objectForKey:NSKeyValueChangeNewKey] boolValue];
         
         [self setAdjustingExposure:isAdjustingExposure];
-
+        
         if (isAdjustingExposure) {
             if ([delegate respondsToSelector:@selector(recorderDidStartAdjustingExposure:)]) {
                 [delegate recorderDidStartAdjustingExposure:self];
-            }            
+            }
         } else {
             if ([delegate respondsToSelector:@selector(recorderDidEndAdjustingExposure:)]) {
                 [delegate recorderDidEndAdjustingExposure:self];
@@ -1027,7 +1037,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
             [self configureDevice:[self videoDevice] mediaType:AVMediaTypeVideo error:&videoError];
             _transformFilter = nil;
             dispatch_sync(_sessionQueue, ^{
-                [self updateVideoOrientation];
+                [self updateVideoOrientationShouldUseDeviceOrientation:NO];
             });
         }
         
@@ -1229,13 +1239,20 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     return [SCRecorderTools videoDeviceForPosition:_device];
 }
 
-- (AVCaptureVideoOrientation)actualVideoOrientation {
+- (AVCaptureVideoOrientation)actualVideoOrientationShouldUseDeviceOrientation:(BOOL)useDeviceOrientation {
     AVCaptureVideoOrientation videoOrientation = _videoOrientation;
     
     if (_autoSetVideoOrientation) {
-        UIDeviceOrientation deviceOrientation = [[UIDevice currentDevice] orientation];
         
-        switch (deviceOrientation) {
+        UIDeviceOrientation orientation;
+        
+        if (useDeviceOrientation) {
+            orientation = useDeviceOrientation;
+        }else{
+            orientation = [self getCurrentOrientationFromAccelerometer];
+        }
+        
+        switch (orientation) {
             case UIDeviceOrientationLandscapeLeft:
                 videoOrientation = AVCaptureVideoOrientationLandscapeRight;
                 break;
@@ -1254,6 +1271,32 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
     }
     
     return videoOrientation;
+}
+
+//Uses the accelerometer data to get the orientation. Useful for when the device orientation is locked.
+- (UIDeviceOrientation)getCurrentOrientationFromAccelerometer{
+    
+    CMAccelerometerData * data = _motionManager.accelerometerData;
+    UIDeviceOrientation orientation = [[UIDevice currentDevice] orientation];
+    
+    if (data) {
+        if (fabs(data.acceleration.y ) < fabs(data.acceleration.x )) {
+            //Landscape
+            if (data.acceleration.x > 0) {
+                orientation = UIDeviceOrientationLandscapeRight;
+            } else {
+                orientation = UIDeviceOrientationLandscapeLeft;
+            }
+            
+            //Portrait
+        } else if (data.acceleration.y > 0){
+            orientation = UIDeviceOrientationPortraitUpsideDown;
+        } else {
+            orientation = UIDeviceOrientationPortrait;
+        }
+    }
+    
+    return orientation;
 }
 
 - (AVCaptureSession*)captureSession {
@@ -1360,7 +1403,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
 
 - (void)setVideoOrientation:(AVCaptureVideoOrientation)videoOrientation {
     _videoOrientation = videoOrientation;
-    [self updateVideoOrientation];
+    [self updateVideoOrientationShouldUseDeviceOrientation:NO];
 }
 
 - (void)setSession:(SCRecordSession *)recordSession {
@@ -1398,7 +1441,7 @@ static char* SCRecorderPhotoOptionsContext = "PhotoOptionsContext";
         [self willChangeValueForKey:@"isAdjustingFocus"];
         
         _adjustingFocus = adjustingFocus;
-                
+        
         [self didChangeValueForKey:@"isAdjustingFocus"];
     }
 }
